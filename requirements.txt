@@ -1,0 +1,2 @@
+pymodbus>=3.6
+mysql-connector-python>=9.0

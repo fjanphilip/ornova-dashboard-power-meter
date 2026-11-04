@@ -1,0 +1,5 @@
+# DB lokal berisi kredensial MySQL & daftar meter per-mesin - jangan di-commit
+*.db
+*.db-journal
+__pycache__/
+.venv/

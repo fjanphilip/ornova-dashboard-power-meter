@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EMS — Listrik</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-mark">EMS</div>
+    <div><div class="brand-title">Energy Monitoring</div><div class="brand-sub">Modbus TCP</div></div>
+  </div>
+  <nav>
+    <a href="#listrik" data-page="listrik"><span class="nav-l"><svg class="ico" viewBox="0 0 24 24"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>Listrik</span></a>
+    <a href="#database" data-page="database"><span class="nav-l"><svg class="ico" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>Koneksi Database</span></a>
+  </nav>
+  <div class="sidebar-foot"><div class="muted small" id="data-source">Menghubungkan…</div></div>
+</aside>
+
+<main>
+  <header class="topbar">
+    <h1 id="page-title">Listrik</h1>
+    <div class="topbar-right"><span class="live-dot"></span><span id="clock" class="muted"></span></div>
+  </header>
+  <div id="page"></div>
+</main>
+
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-head"><h3 id="drawer-title"></h3><button id="drawer-close" class="ghost">Tutup</button></div>
+  <div id="drawer-body"></div>
+</div>
+
+<dialog id="form-dlg">
+  <form method="dialog" id="form">
+    <h3 id="form-title">Tambah perangkat</h3>
+    <div class="form-grid">
+      <label for="f-name">Nama titik ukur</label><input id="f-name" required placeholder="mis. Panel Utama">
+      <label for="f-area">Area</label><input id="f-area" placeholder="mis. Produksi">
+      <label for="f-model">Model meter</label>
+      <select id="f-model"><option value="pm5330">Schneider PM5330</option><option value="sdm630">Eastron SDM630</option></select>
+      <label for="f-host">IP / host</label><input id="f-host" required placeholder="192.168.1.110">
+      <label for="f-port">Port</label><input id="f-port" type="number" min="1" max="65535" value="502" required>
+      <label for="f-unit_id">Unit ID (slave)</label><input id="f-unit_id" type="number" min="0" max="247" value="1" required>
+      <label for="f-function">Function</label>
+      <select id="f-function"><option value="input">Input register (FC4)</option><option value="holding">Holding register (FC3)</option></select>
+      <label for="f-byte_order">Urutan byte float32</label>
+      <select id="f-byte_order"><option value="big">big (ABCD)</option><option value="swap">swap (CDAB)</option><option value="badc">BADC</option><option value="little">little (DCBA)</option></select>
+      <label for="f-interval_s">Interval baca (detik)</label><input id="f-interval_s" type="number" min="0.5" step="0.5" value="2" required>
+      <label for="f-enabled">Aktif</label><input id="f-enabled" type="checkbox" checked style="justify-self:start">
+    </div>
+    <div id="form-err" class="form-err" hidden></div>
+    <div class="toolbar mt" style="margin-bottom:0">
+      <button type="submit" id="form-save">Simpan</button>
+      <button type="button" id="form-cancel" class="ghost">Batal</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="db-dlg">
+  <form method="dialog" id="db-form">
+    <h3 id="db-form-title">Tambah koneksi database</h3>
+    <div class="form-grid">
+      <label for="c-name">Nama koneksi</label><input id="c-name" required placeholder="mis. Server Pabrik">
+      <label for="c-host">Host server</label><input id="c-host" required placeholder="192.168.1.20 atau nama host">
+      <label for="c-port">Port</label><input id="c-port" type="number" min="1" max="65535" value="3306" required>
+      <label for="c-db_user">User</label><input id="c-db_user" required autocomplete="off">
+      <label for="c-db_password">Password</label><input id="c-db_password" type="password" autocomplete="new-password">
+      <label for="c-db_name">Nama database</label><input id="c-db_name" required value="ois_sosro_pw">
+      <label for="c-store_interval_s">Interval simpan (detik)</label><input id="c-store_interval_s" type="number" min="1" value="60" required>
+    </div>
+    <div class="muted small mt" id="c-pw-hint" hidden>Kosongkan password untuk mempertahankan password yang tersimpan.</div>
+    <div id="c-result" class="form-msg" hidden></div>
+    <div class="toolbar mt" style="margin-bottom:0">
+      <button type="submit">Simpan</button>
+      <button type="button" id="c-test" class="ghost">Tes koneksi</button>
+      <button type="button" id="c-cancel" class="ghost">Batal</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
