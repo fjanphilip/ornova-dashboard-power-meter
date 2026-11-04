@@ -8,9 +8,12 @@ import argparse
 import inspect
 import json
 import logging
+import logging.handlers
 import math
 import mimetypes
 import re
+import secrets
+import socket
 import sqlite3
 import struct
 import threading
@@ -63,10 +66,16 @@ DEFAULT_DB_NAME = "ois_sosro_pw"
 CONN_FIELDS = ("name", "host", "port", "db_user", "db_password", "db_name", "store_interval_s")
 DB_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")  # dipakai sebagai identifier SQL, jadi dibatasi ketat
 MAX_RETRY_S = 30
+SOURCE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,50}$")  # nama mini PC pengirim; bagian dari kunci unik data
+BATCH_SIZE = 500            # baris outbox per kiriman ke MySQL
+OUTBOX_MAX_ROWS = 500_000   # batas buffer lokal (~7 hari untuk 40 meter @60 dtk); terlama dibuang
+MAX_BODY_BYTES = 64 * 1024
+MYSQL_NO_PRIVILEGE = (1044, 1142, 1227)  # user penulis (hanya INSERT) tidak boleh CREATE/ALTER
 
 PHASE_COLUMNS = [f"{k}{n}" for k in ("v", "i", "p", "s") for n in (1, 2, 3)]
 READINGS_DDL = f"""CREATE TABLE IF NOT EXISTS power_readings (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    source VARCHAR(50) NOT NULL,
     recorded_at DATETIME(3) NOT NULL,
     device_id INT NOT NULL,
     device_name VARCHAR(100) NOT NULL,
@@ -74,13 +83,20 @@ READINGS_DDL = f"""CREATE TABLE IF NOT EXISTS power_readings (
     unit_id SMALLINT NOT NULL,
     {', '.join(f'{c} FLOAT NULL' for c in PHASE_COLUMNS)},
     p_total FLOAT NULL, s_total FLOAT NULL, freq FLOAT NULL,
+    UNIQUE KEY uq_sample (source, device_id, recorded_at),
     INDEX idx_device_time (device_id, recorded_at),
     INDEX idx_time (recorded_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+# Kolom baris outbox/MySQL (tanpa id & source). Urutan sama di SQLite outbox, INSERT, dan _rows().
+SAMPLE_COLUMNS = ["recorded_at", "device_id", "device_name", "host", "unit_id", *PHASE_COLUMNS,
+                  "p_total", "s_total", "freq"]
+# INSERT IGNORE + kunci unik (source, device_id, recorded_at): kirim ulang batch setelah putus tidak menggandakan data.
 READINGS_INSERT = (
-    "INSERT INTO power_readings (recorded_at, device_id, device_name, host, unit_id, "
-    f"{', '.join(PHASE_COLUMNS)}, p_total, s_total, freq) VALUES ({', '.join(['%s'] * (5 + len(PHASE_COLUMNS) + 3))})"
+    f"INSERT IGNORE INTO power_readings (source, {', '.join(SAMPLE_COLUMNS)}) "
+    f"VALUES ({', '.join(['%s'] * (1 + len(SAMPLE_COLUMNS)))})"
 )
+
+log = logging.getLogger("dashboard")
 
 
 # ---------- database ----------
@@ -115,6 +131,34 @@ def init_db():
                 store_interval_s REAL NOT NULL DEFAULT 60,
                 active INTEGER NOT NULL DEFAULT 0)"""
         )
+        con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        # Buffer lokal: sampel ditulis ke sini dulu, baru dikirim ke MySQL. Aman saat jaringan/MySQL putus.
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT NOT NULL, "
+            "device_id INTEGER NOT NULL, device_name TEXT NOT NULL, host TEXT NOT NULL, unit_id INTEGER NOT NULL, "
+            f"{', '.join(f'{c} REAL' for c in PHASE_COLUMNS)}, p_total REAL, s_total REAL, freq REAL)"
+        )
+        if not con.execute("SELECT 1 FROM settings WHERE key='api_token'").fetchone():
+            con.execute("INSERT INTO settings (key, value) VALUES ('api_token', ?)", (secrets.token_urlsafe(24),))
+        if not con.execute("SELECT 1 FROM settings WHERE key='source'").fetchone():
+            con.execute("INSERT INTO settings (key, value) VALUES ('source', ?)", (default_source(),))
+
+
+def default_source():
+    name = re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname())[:50]
+    return name or "minipc"
+
+
+def get_setting(key):
+    with db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_setting(key, value):
+    with db() as con:
+        con.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
 def validate(body):
@@ -364,17 +408,26 @@ def ensure_schema(cfg):
         cur.execute(f"CREATE DATABASE IF NOT EXISTS `{cfg['db_name']}` CHARACTER SET utf8mb4")
         cur.execute(f"USE `{cfg['db_name']}`")
         cur.execute(READINGS_DDL)
+        # Migrasi tabel lama (sebelum ada kolom source): tambah kolom + kunci unik.
+        cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s "
+                    "AND TABLE_NAME='power_readings' AND COLUMN_NAME='source'", (cfg["db_name"],))
+        if not cur.fetchone()[0]:
+            cur.execute("ALTER TABLE power_readings ADD COLUMN source VARCHAR(50) NOT NULL DEFAULT '' AFTER id")
+            cur.execute("ALTER TABLE power_readings ADD UNIQUE KEY uq_sample (source, device_id, recorded_at)")
         con.commit()
     finally:
         con.close()
 
 
 class Storer:
-    """Menyimpan pembacaan terakhir semua meter ke koneksi aktif tiap store_interval_s."""
+    """Dua tahap supaya data tidak hilang saat MySQL/jaringan putus:
+    1) sampler mencatat pembacaan terakhir semua meter ke tabel outbox lokal tiap store_interval_s;
+    2) sender mengirim outbox ke MySQL per batch dan menghapus baris yang sudah terkirim."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.wake = threading.Event()  # di-set saat koneksi aktif berubah
+        self.interval = None           # interval sampling koneksi aktif; None = tidak ada koneksi aktif
         self.info = {"connection_id": None, "state": "idle", "error": None, "last_write": None, "rows_total": 0}
 
     def reload(self):
@@ -382,7 +435,10 @@ class Storer:
 
     def status(self):
         with self.lock:
-            return dict(self.info)
+            info = dict(self.info)
+        with db() as con:
+            info["pending"] = con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+        return info
 
     def _set(self, **kv):
         with self.lock:
@@ -395,9 +451,49 @@ class Storer:
             if not (d["enabled"] and live):
                 continue
             values = [live[k][n] for k in ("v", "i", "p", "s") for n in range(3)]
-            rows.append((datetime.fromtimestamp(d["ts"]), d["id"], d["name"], d["host"], d["unit_id"],
+            stamp = datetime.fromtimestamp(d["ts"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            rows.append((stamp, d["id"], d["name"], d["host"], d["unit_id"],
                          *values, live["p_total"], live["s_total"], live["freq"]))
         return rows
+
+    def _sample(self):
+        rows = self._rows()
+        if not rows:
+            return
+        with db() as con:
+            con.executemany(
+                f"INSERT INTO outbox ({', '.join(SAMPLE_COLUMNS)}) VALUES ({', '.join('?' * len(SAMPLE_COLUMNS))})", rows)
+            dropped = con.execute("DELETE FROM outbox WHERE id <= (SELECT MAX(id) FROM outbox) - ?",
+                                  (OUTBOX_MAX_ROWS,)).rowcount
+        if dropped:
+            log.warning("outbox penuh (%d baris): %d sampel terlama dibuang", OUTBOX_MAX_ROWS, dropped)
+
+    def _flush_batch(self, conn):
+        """Kirim satu batch outbox. Return jumlah baris terkirim (0 = outbox kosong)."""
+        with db() as con:
+            batch = con.execute("SELECT * FROM outbox ORDER BY id LIMIT ?", (BATCH_SIZE,)).fetchall()
+        if not batch:
+            return 0
+        source = get_setting("source")
+        cur = conn.cursor()
+        cur.executemany(READINGS_INSERT, [(source, *(r[c] for c in SAMPLE_COLUMNS)) for r in batch])
+        conn.commit()
+        cur.close()
+        with db() as con:
+            con.execute("DELETE FROM outbox WHERE id <= ?", (batch[-1]["id"],))
+        return len(batch)
+
+    def run_sampler(self):
+        next_at = 0.0
+        while True:
+            interval = self.interval
+            if interval and time.monotonic() >= next_at:
+                try:
+                    self._sample()
+                except Exception:
+                    log.exception("gagal mencatat sampel ke outbox")
+                next_at = time.monotonic() + interval
+            time.sleep(1)
 
     def run(self):
         conn, cfg, next_at = None, None, 0.0
@@ -407,24 +503,31 @@ class Storer:
                 if conn:
                     conn.close()
                 conn, cfg, next_at = None, get_active_connection(), 0.0
+                self.interval = cfg["store_interval_s"] if cfg else None
                 self._set(connection_id=cfg["id"] if cfg else None, state="connecting" if cfg else "idle",
                           error=None, last_write=None, rows_total=0)
             if cfg and time.monotonic() >= next_at:
                 retry = cfg["store_interval_s"]
                 try:
                     conn = conn or mysql_connect(cfg)
-                    rows = self._rows()
-                    if rows:
-                        conn.cursor().executemany(READINGS_INSERT, rows)
-                        conn.commit()
+                    sent = 0
+                    while True:
+                        n = self._flush_batch(conn)
+                        sent += n
+                        if n < BATCH_SIZE:
+                            break
+                    if self.info["state"] == "error":
+                        log.info("pengiriman ke MySQL pulih")
                     with self.lock:
-                        self.info.update(state="ok", error=None, rows_total=self.info["rows_total"] + len(rows))
-                        if rows:
+                        self.info.update(state="ok", error=None, rows_total=self.info["rows_total"] + sent)
+                        if sent:
                             self.info["last_write"] = time.time()
                 except Exception as exc:
                     if conn:
                         conn.close()
                     conn = None
+                    if self.info["state"] != "error":
+                        log.warning("gagal kirim ke MySQL (data ditahan di outbox): %s", exc)
                     self._set(state="error", error=str(exc) or exc.__class__.__name__)
                     retry = min(retry, MAX_RETRY_S)  # server pabrik putus: coba lagi lebih cepat
                 next_at = time.monotonic() + retry
@@ -447,6 +550,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _guard(self, method, path):
+        """Lindungi operasi tulis & rute koneksi database. Return True kalau request sudah ditolak.
+
+        Lapisan: (1) Origin harus sama dengan Host (tutup CSRF dari halaman web lain),
+        (2) Content-Type JSON (form lintas-situs tidak bisa mengirimnya tanpa preflight),
+        (3) token Bearer. Tampilan monitoring (GET /api/devices & file statis) tetap terbuka."""
+        if method == "GET" and not path.startswith("/api/db-connections"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).netloc != self.headers.get("Host"):
+            self._json(403, {"error": "origin ditolak"})
+        elif method != "GET" and not (self.headers.get("Content-Type") or "").startswith("application/json"):
+            self._json(415, {"error": "Content-Type harus application/json"})
+        elif not (self.headers.get("Content-Length") or "0").isdigit() or                 int(self.headers.get("Content-Length") or 0) > MAX_BODY_BYTES:
+            self._json(413, {"error": "body tidak valid atau terlalu besar"})
+        elif not secrets.compare_digest(self.headers.get("Authorization") or "",
+                                        f"Bearer {get_setting('api_token')}"):
+            self._json(401, {"error": "token tidak valid"})
+        else:
+            return False
+        return True
 
     def _body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -505,7 +630,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 ensure_schema(existing)
             except mysql.connector.Error as exc:
-                return self._json(400, {"error": f"Gagal menyiapkan database: {exc}"}) or True
+                # User khusus-INSERT tidak berhak CREATE/ALTER: skema dianggap sudah disiapkan setup_db.py.
+                if exc.errno not in MYSQL_NO_PRIVILEGE:
+                    return self._json(400, {"error": f"Gagal menyiapkan database: {exc}"}) or True
             with db() as con:
                 con.execute("UPDATE db_connections SET active = (id=?)", (conn_id,))
             STORER.reload()
@@ -527,6 +654,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if self._guard("GET", path):
+            return
         if self._conn_route("GET", path):
             return
         if path == "/api/devices":
@@ -544,6 +673,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
+        if self._guard("POST", urlparse(self.path).path):
+            return
         if self._conn_route("POST", urlparse(self.path).path):
             return
         if urlparse(self.path).path != "/api/devices":
@@ -562,6 +693,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(201, dev)
 
     def do_PUT(self):
+        if self._guard("PUT", urlparse(self.path).path):
+            return
         if self._conn_route("PUT", urlparse(self.path).path):
             return
         dev_id = self._dev_id(urlparse(self.path).path)
@@ -580,6 +713,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, dev)
 
     def do_DELETE(self):
+        if self._guard("DELETE", urlparse(self.path).path):
+            return
         if self._conn_route("DELETE", urlparse(self.path).path):
             return
         dev_id = self._dev_id(urlparse(self.path).path)
@@ -591,16 +726,27 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
 
+def setup_logging():
+    """Log ke file berputar (hanya kejadian penting: error & perubahan status) untuk debugging tanpa operator."""
+    handler = logging.handlers.RotatingFileHandler(BASE / "dashboard.log", maxBytes=1_000_000, backupCount=3,
+                                                   encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Dashboard listrik Modbus TCP")
     parser.add_argument("--host", default="127.0.0.1", help="alamat bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
+    setup_logging()
     init_db()
     for dev in list_devices():
         if dev["enabled"]:
             POLLER.start(dev)
+    threading.Thread(target=STORER.run_sampler, daemon=True).start()
     threading.Thread(target=STORER.run, daemon=True).start()
     STORER.reload()  # muat koneksi aktif (kalau ada) dari konfigurasi tersimpan
 

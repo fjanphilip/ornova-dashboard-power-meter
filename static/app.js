@@ -11,10 +11,20 @@ const st = { page: 'listrik', devices: [], area: 'all', q: '', openId: null, edi
   conns: [], dbStatus: {}, editConnId: null };
 
 // ---------- API ----------
-async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts,
+// Token admin dipakai untuk operasi tulis & halaman koneksi database. Diminta sekali, disimpan di browser ini.
+const getToken = () => { try { return localStorage.getItem('apiToken') || ''; } catch { return ''; } };
+const setToken = t => { try { localStorage.setItem('apiToken', t); } catch { /* storage diblokir: diminta lagi nanti */ } };
+
+async function api(path, opts = {}, retried = false) {
+  const token = getToken();
+  const res = await fetch(path, { ...opts,
+    headers: { 'Content-Type': 'application/json', ...(token && { Authorization: 'Bearer ' + token }) },
     body: opts.body ? JSON.stringify(opts.body) : undefined });
   const json = await res.json().catch(() => ({}));
+  if (res.status === 401 && !retried) {
+    const entered = prompt('Token admin dashboard (dari output setup_db.py):');
+    if (entered) { setToken(entered.trim()); return api(path, opts, true); }
+  }
   if (!res.ok) throw new Error(json.error || `${path}: HTTP ${res.status}`);
   return json;
 }
@@ -227,7 +237,7 @@ function renderDb() {
     <div class="card kpi elec"><div class="label">Status</div><div class="value" style="font-size:20px">${active ? connStatus(active) : DASH}</div>
       <div class="sub">${s.state === 'error' ? esc(s.error) : '&nbsp;'}</div></div>
     <div class="card kpi elec"><div class="label">Terakhir menyimpan</div><div class="value" style="font-size:22px">${last}</div></div>
-    <div class="card kpi elec"><div class="label">Baris tersimpan</div><div class="value">${nf(s.rows_total || 0)}</div><div class="sub">sejak koneksi diaktifkan</div></div>`;
+    <div class="card kpi elec"><div class="label">Baris tersimpan</div><div class="value">${nf(s.rows_total || 0)}</div><div class="sub">${s.pending ? nf(s.pending) + ' menunggu terkirim' : 'sejak koneksi diaktifkan'}</div></div>`;
 
   $('#conn-rows').innerHTML = st.conns.length ? st.conns.map(c => `<tr data-id="${c.id}">
     <td><strong>${esc(c.name)}</strong></td><td>${esc(c.host)}:${c.port}</td><td>${esc(c.db_name)}</td><td>${esc(c.db_user)}</td>
