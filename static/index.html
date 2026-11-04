@@ -80,6 +80,19 @@
   </form>
 </dialog>
 
+<dialog id="token-dlg">
+  <form id="token-form">
+    <h3>Token admin diperlukan</h3>
+    <p class="muted small" style="margin-top:0">Tempel token dari output <code>setup_db.py</code>. Hanya ditanya sekali per browser.</p>
+    <input id="token-input" type="password" autocomplete="off" required placeholder="Token admin" style="width:100%">
+    <div id="token-err" class="form-err" hidden></div>
+    <div class="toolbar mt" style="margin-bottom:0">
+      <button type="submit">Masuk</button>
+      <button type="button" id="token-cancel" class="ghost">Batal</button>
+    </div>
+  </form>
+</dialog>
+
 <script src="app.js"></script>
 </body>
 </html>

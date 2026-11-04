@@ -15,15 +15,40 @@ const st = { page: 'listrik', devices: [], area: 'all', q: '', openId: null, edi
 const getToken = () => { try { return localStorage.getItem('apiToken') || ''; } catch { return ''; } };
 const setToken = t => { try { localStorage.setItem('apiToken', t); } catch { /* storage diblokir: diminta lagi nanti */ } };
 
-async function api(path, opts = {}, retried = false) {
-  const token = getToken();
+// Satu dialog untuk semua request yang kena 401 bersamaan (mis. polling), supaya tidak muncul berkali-kali.
+let tokenAsk = null;
+function askToken(errMsg) {
+  if (tokenAsk) return tokenAsk;
+  tokenAsk = new Promise(resolve => {
+    const dlg = $('#token-dlg'), input = $('#token-input'), err = $('#token-err');
+    err.textContent = errMsg || ''; err.hidden = !errMsg;
+    input.value = '';
+    const finish = v => { dlg.close(); tokenAsk = null; resolve(v); };
+    $('#token-form').onsubmit = e => { e.preventDefault(); finish(input.value.trim() || null); };
+    $('#token-cancel').onclick = () => finish(null);
+    dlg.oncancel = e => { e.preventDefault(); finish(null); }; // tombol Esc
+    dlg.showModal();
+    input.focus();
+  });
+  return tokenAsk;
+}
+
+async function send(path, opts, token) {
   const res = await fetch(path, { ...opts,
     headers: { 'Content-Type': 'application/json', ...(token && { Authorization: 'Bearer ' + token }) },
     body: opts.body ? JSON.stringify(opts.body) : undefined });
-  const json = await res.json().catch(() => ({}));
-  if (res.status === 401 && !retried) {
-    const entered = prompt('Token admin dashboard (dari output setup_db.py):');
-    if (entered) { setToken(entered.trim()); return api(path, opts, true); }
+  return { res, json: await res.json().catch(() => ({})) };
+}
+
+async function api(path, opts = {}) {
+  let token = getToken();
+  let { res, json } = await send(path, opts, token);
+  while (res.status === 401) { // token kosong/salah: tanya sampai benar atau dibatalkan
+    const entered = await askToken(token ? 'Token salah atau sudah diganti. Coba lagi.' : '');
+    if (!entered) break;
+    token = entered;
+    ({ res, json } = await send(path, opts, token));
+    if (res.ok) setToken(token); // simpan hanya setelah terbukti benar
   }
   if (!res.ok) throw new Error(json.error || `${path}: HTTP ${res.status}`);
   return json;
